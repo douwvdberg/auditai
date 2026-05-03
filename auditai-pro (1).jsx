@@ -1,0 +1,808 @@
+import { useState, useEffect, useRef, useCallback } from "react";
+
+// ─── Storage helpers ──────────────────────────────────────────────────────────
+const STORAGE_KEYS = {
+  history: "auditai_history",
+  rubrics: "auditai_rubrics",
+  vendors: "auditai_vendors",
+};
+
+const store = {
+  get: (k) => { try { return JSON.parse(localStorage.getItem(k)) || null; } catch { return null; } },
+  set: (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
+};
+
+// ─── Default rubrics ──────────────────────────────────────────────────────────
+const DEFAULT_RUBRICS = [
+  { id: "factual",     label: "Factual Accuracy",      icon: "⬡", desc: "Claims are verifiable and grounded" },
+  { id: "relevance",   label: "Relevance",              icon: "◎", desc: "Output addresses the actual request" },
+  { id: "depth",       label: "Depth & Completeness",   icon: "▣", desc: "Sufficient detail without padding" },
+  { id: "clarity",     label: "Clarity",                icon: "◇", desc: "Unambiguous, well-structured prose" },
+  { id: "originality", label: "Originality",            icon: "△", desc: "Avoids boilerplate AI patterns" },
+  { id: "fitness",     label: "Fitness for Purpose",    icon: "○", desc: "Suitable for stated use case" },
+];
+
+// ─── Colour helpers ───────────────────────────────────────────────────────────
+const scoreColor = (s) =>
+  s >= 8 ? "#00ffa3" : s >= 6 ? "#ffe156" : s >= 4 ? "#ff8c42" : "#ff4466";
+
+const grade = (s) =>
+  s >= 9 ? "A+" : s >= 8 ? "A" : s >= 7 ? "B" : s >= 6 ? "C" : s >= 4 ? "D" : "F";
+
+// ─── Mini components ──────────────────────────────────────────────────────────
+const Ring = ({ score, size = 72 }) => {
+  const r = (size - 8) / 2;
+  const circ = 2 * Math.PI * r;
+  const col = scoreColor(score);
+  return (
+    <svg width={size} height={size} style={{ transform: "rotate(-90deg)", flexShrink: 0 }}>
+      <circle cx={size/2} cy={size/2} r={r} fill="none" stroke="#1a1a2e" strokeWidth={6} />
+      <circle cx={size/2} cy={size/2} r={r} fill="none" stroke={col} strokeWidth={6}
+        strokeDasharray={`${(score/10)*circ} ${circ}`} strokeLinecap="round"
+        style={{ transition: "stroke-dasharray 1.2s cubic-bezier(.4,0,.2,1)" }} />
+      <text x="50%" y="50%" textAnchor="middle" dominantBaseline="central"
+        style={{ transform:"rotate(90deg)", transformOrigin:"center",
+          fill: col, fontSize: size*0.25, fontFamily:"'DM Mono',monospace", fontWeight:700 }}>
+        {score}
+      </text>
+    </svg>
+  );
+};
+
+const Bar = ({ score, animate, height = 5 }) => (
+  <div style={{ height, background: "#111124", borderRadius: 3, overflow:"hidden", width:"100%" }}>
+    <div style={{
+      height:"100%", width: animate ? `${score*10}%` : "0%",
+      background: scoreColor(score), borderRadius:3,
+      transition:"width 1.4s cubic-bezier(.4,0,.2,1)",
+      boxShadow:`0 0 8px ${scoreColor(score)}55`
+    }} />
+  </div>
+);
+
+const Tag = ({ children, color = "#00ffa3" }) => (
+  <span style={{
+    background: `${color}18`, color, border:`1px solid ${color}33`,
+    borderRadius:4, padding:"2px 8px", fontSize:10,
+    fontFamily:"'DM Mono',monospace", letterSpacing:1
+  }}>{children}</span>
+);
+
+// ─── TABS ─────────────────────────────────────────────────────────────────────
+const TABS = ["Audit", "History", "Vendors", "Rubrics"];
+
+// ─── MAIN APP ─────────────────────────────────────────────────────────────────
+export default function App() {
+  const [tab, setTab] = useState("Audit");
+  const [context, setContext] = useState("");
+  const [content, setContent] = useState("");
+  const [vendor, setVendor] = useState("");
+  const [bulkMode, setBulkMode] = useState(false);
+  const [bulkItems, setBulkItems] = useState([{ id:1, label:"Item 1", content:"" }]);
+  const [loading, setLoading] = useState(false);
+  const [result, setResult] = useState(null);
+  const [bulkResults, setBulkResults] = useState([]);
+  const [animate, setAnimate] = useState(false);
+  const [history, setHistory] = useState([]);
+  const [vendors, setVendors] = useState({});
+  const [rubrics, setRubrics] = useState(DEFAULT_RUBRICS);
+  const [newRubric, setNewRubric] = useState({ label:"", desc:"" });
+  const [editingRubric, setEditingRubric] = useState(null);
+  const [notification, setNotification] = useState(null);
+  const resultRef = useRef(null);
+
+  // Load persisted data
+  useEffect(() => {
+    setHistory(store.get(STORAGE_KEYS.history) || []);
+    setVendors(store.get(STORAGE_KEYS.vendors) || {});
+    const saved = store.get(STORAGE_KEYS.rubrics);
+    if (saved?.length) setRubrics(saved);
+  }, []);
+
+  const notify = (msg, type = "success") => {
+    setNotification({ msg, type });
+    setTimeout(() => setNotification(null), 3000);
+  };
+
+  const saveHistory = (entry) => {
+    const updated = [entry, ...history].slice(0, 100);
+    setHistory(updated);
+    store.set(STORAGE_KEYS.history, updated);
+  };
+
+  const saveVendorScore = (vendorName, overall, scores) => {
+    if (!vendorName.trim()) return;
+    const existing = vendors[vendorName] || { name: vendorName, audits: [] };
+    const updated = {
+      ...existing,
+      audits: [{ date: new Date().toISOString(), overall, scores }, ...existing.audits].slice(0, 50)
+    };
+    const updatedAll = { ...vendors, [vendorName]: updated };
+    setVendors(updatedAll);
+    store.set(STORAGE_KEYS.vendors, updatedAll);
+  };
+
+  // Build prompt with custom rubrics
+  const buildPrompt = (ctx, text) => {
+    const rubricList = rubrics.map(r => `- "${r.id}" (${r.label}): ${r.desc}`).join("\n");
+    return `You are an expert AI output quality auditor. Evaluate the AI-generated content below.
+
+USE CASE / CONTEXT:
+${ctx || "General professional communication"}
+
+AI-GENERATED CONTENT:
+"""
+${text}
+"""
+
+Score each dimension 1–10. Be brutally honest, specific, and concise (1–2 sentences per critique).
+Also identify 2–4 suspicious sentences that may contain unverified claims — quote them very briefly (under 8 words) and flag why.
+
+DIMENSIONS TO SCORE:
+${rubricList}
+
+Respond ONLY with valid JSON — no preamble, no markdown:
+{
+  "overall": <number>,
+  "verdict": "<one sharp sentence>",
+  "scores": { ${rubrics.map(r => `"${r.id}": <number>`).join(", ")} },
+  "critiques": { ${rubrics.map(r => `"${r.id}": "<critique>"`).join(", ")} },
+  "redFlags": ["<flag>", "<flag>"],
+  "suspiciousClaims": [{"claim":"<short quote>","reason":"<why unverified>"}],
+  "topFix": "<single most impactful improvement>",
+  "aiPatterns": ["<specific AI tell found in this text>"]
+}`;
+  };
+
+  const runSingleAudit = async (ctx, text) => {
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 1000,
+        messages: [{ role: "user", content: buildPrompt(ctx, text) }],
+      }),
+    });
+    const data = await response.json();
+    const raw = data.content.filter(b => b.type === "text").map(b => b.text).join("");
+    return JSON.parse(raw.replace(/```json|```/g, "").trim());
+  };
+
+  const handleAudit = async () => {
+    if (bulkMode) {
+      const filled = bulkItems.filter(i => i.content.trim());
+      if (!filled.length) return;
+      setLoading(true); setBulkResults([]); setResult(null);
+      const results = [];
+      for (const item of filled) {
+        try {
+          const r = await runSingleAudit(context, item.content);
+          results.push({ ...r, label: item.label });
+          if (vendor.trim()) saveVendorScore(vendor, r.overall, r.scores);
+          saveHistory({ id: Date.now() + Math.random(), date: new Date().toISOString(),
+            context, content: item.content, label: item.label, vendor,
+            overall: r.overall, verdict: r.verdict, scores: r.scores });
+        } catch { results.push({ label: item.label, error: true, overall: 0 }); }
+      }
+      setBulkResults(results);
+      setLoading(false);
+      setTimeout(() => { setAnimate(true); resultRef.current?.scrollIntoView({ behavior:"smooth" }); }, 100);
+      notify(`${results.length} audits complete`);
+    } else {
+      if (!content.trim()) return;
+      setLoading(true); setResult(null); setAnimate(false);
+      try {
+        const r = await runSingleAudit(context, content);
+        setResult(r);
+        if (vendor.trim()) saveVendorScore(vendor, r.overall, r.scores);
+        saveHistory({ id: Date.now(), date: new Date().toISOString(),
+          context, content, vendor, overall: r.overall,
+          verdict: r.verdict, scores: r.scores });
+        setTimeout(() => { setAnimate(true); resultRef.current?.scrollIntoView({ behavior:"smooth" }); }, 100);
+        notify("Audit complete");
+      } catch { notify("Audit failed — try again", "error"); }
+      setLoading(false);
+    }
+  };
+
+  const addBulkItem = () => setBulkItems(p => [...p, { id: Date.now(), label:`Item ${p.length+1}`, content:"" }]);
+  const removeBulkItem = (id) => setBulkItems(p => p.filter(i => i.id !== id));
+  const updateBulkItem = (id, field, val) => setBulkItems(p => p.map(i => i.id === id ? {...i,[field]:val} : i));
+
+  const saveRubrics = (updated) => {
+    setRubrics(updated);
+    store.set(STORAGE_KEYS.rubrics, updated);
+    notify("Rubrics saved");
+  };
+
+  const deleteVendor = (name) => {
+    const updated = { ...vendors };
+    delete updated[name];
+    setVendors(updated);
+    store.set(STORAGE_KEYS.vendors, updated);
+    notify("Vendor removed");
+  };
+
+  const clearHistory = () => {
+    setHistory([]);
+    store.set(STORAGE_KEYS.history, []);
+    notify("History cleared");
+  };
+
+  // ── Styles ──────────────────────────────────────────────────────────────────
+  const S = {
+    wrap: { minHeight:"100vh", background:"#080812", color:"#ddddf0",
+      fontFamily:"'DM Sans',sans-serif", position:"relative" },
+    inner: { maxWidth:960, margin:"0 auto", padding:"0 20px 80px" },
+    nav: { borderBottom:"1px solid #14142a", padding:"0 20px",
+      display:"flex", alignItems:"center", justifyContent:"space-between",
+      position:"sticky", top:0, zIndex:50,
+      background:"rgba(8,8,18,0.92)", backdropFilter:"blur(16px)" },
+    logo: { fontFamily:"'DM Mono',monospace", fontSize:15, fontWeight:700,
+      color:"#ddddf0", padding:"18px 0", display:"flex", alignItems:"center", gap:8 },
+    logoDot: { width:8, height:8, background:"#00ffa3", borderRadius:"50%",
+      animation:"blink 2s infinite" },
+    tabs: { display:"flex", gap:4 },
+    tab: (active) => ({
+      padding:"6px 14px", borderRadius:6, border:"none", cursor:"pointer",
+      fontFamily:"'DM Mono',monospace", fontSize:11, letterSpacing:1,
+      background: active ? "#00ffa315" : "transparent",
+      color: active ? "#00ffa3" : "#555570",
+      transition:"all 0.15s"
+    }),
+    card: { background:"#0d0d1e", border:"1px solid #18182e",
+      borderRadius:14, overflow:"hidden", marginBottom:16 },
+    cardHead: { borderBottom:"1px solid #18182e", padding:"14px 20px",
+      display:"flex", alignItems:"center", justifyContent:"space-between" },
+    label: { fontFamily:"'DM Mono',monospace", fontSize:10,
+      color:"#444460", letterSpacing:3, textTransform:"uppercase" },
+    input: { width:"100%", background:"transparent", border:"none",
+      color:"#ddddf0", fontSize:14, fontFamily:"'DM Sans',sans-serif",
+      outline:"none", lineHeight:1.6 },
+    textarea: { width:"100%", background:"transparent", border:"none",
+      color:"#ddddf0", fontSize:13, fontFamily:"'DM Sans',sans-serif",
+      outline:"none", lineHeight:1.7, resize:"vertical" },
+    btn: (variant="primary") => ({
+      background: variant==="primary" ? "#00ffa3" : variant==="danger" ? "#ff446620" : "#14142a",
+      color: variant==="primary" ? "#080812" : variant==="danger" ? "#ff4466" : "#8888aa",
+      border: variant==="danger" ? "1px solid #ff446640" : "none",
+      borderRadius:8, padding: variant==="primary" ? "12px 26px" : "8px 16px",
+      fontFamily:"'DM Mono',monospace", fontSize: variant==="primary" ? 13 : 11,
+      fontWeight:700, cursor:"pointer", transition:"all 0.2s",
+      letterSpacing: variant==="primary" ? 0.5 : 1
+    }),
+    sectionTitle: { fontFamily:"'DM Mono',monospace", fontSize:11,
+      color:"#00ffa3", letterSpacing:3, textTransform:"uppercase",
+      marginBottom:20, display:"flex", alignItems:"center", gap:10 },
+    ghost: { background:"transparent", border:"1px solid #18182e",
+      color:"#555570", borderRadius:6, padding:"6px 14px",
+      fontFamily:"'DM Mono',monospace", fontSize:11, cursor:"pointer",
+      transition:"all 0.2s", letterSpacing:1 },
+  };
+
+  // ── RENDER TABS ─────────────────────────────────────────────────────────────
+  const renderAudit = () => (
+    <div style={{ paddingTop:32 }}>
+      {/* Header */}
+      <div style={{ marginBottom:36 }}>
+        <h1 style={{ fontFamily:"'DM Mono',monospace", fontSize:"clamp(24px,4vw,42px)",
+          fontWeight:700, letterSpacing:-1, marginBottom:8,
+          background:"linear-gradient(135deg,#ddddf0,#555580)",
+          WebkitBackgroundClip:"text", WebkitTextFillColor:"transparent" }}>
+          AI Output Auditor
+        </h1>
+        <p style={{ color:"#444460", fontSize:14 }}>
+          Paste AI content. Get a quality score across {rubrics.length} dimensions in seconds.
+        </p>
+      </div>
+
+      {/* Mode toggle */}
+      <div style={{ display:"flex", gap:8, marginBottom:20 }}>
+        {["Single", "Bulk"].map(m => (
+          <button key={m} onClick={() => { setBulkMode(m==="Bulk"); setResult(null); setBulkResults([]); }}
+            style={{ ...S.tab(bulkMode === (m==="Bulk")), padding:"8px 18px" }}>
+            {m} {m==="Bulk" && <span style={{ color:"#00ffa3", marginLeft:4 }}>BETA</span>}
+          </button>
+        ))}
+      </div>
+
+      {/* Context + Vendor row */}
+      <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12, marginBottom:12 }}>
+        <div style={S.card}>
+          <div style={{ padding:"12px 18px" }}>
+            <p style={{ ...S.label, marginBottom:6 }}>Use Case / Context</p>
+            <input value={context} onChange={e=>setContext(e.target.value)}
+              placeholder="e.g. Marketing email to enterprise CTOs..."
+              style={S.input} />
+          </div>
+        </div>
+        <div style={S.card}>
+          <div style={{ padding:"12px 18px" }}>
+            <p style={{ ...S.label, marginBottom:6 }}>Vendor / Source (optional)</p>
+            <input value={vendor} onChange={e=>setVendor(e.target.value)}
+              placeholder="e.g. Agency XYZ, Freelancer A..."
+              style={S.input} />
+          </div>
+        </div>
+      </div>
+
+      {/* Content input */}
+      {!bulkMode ? (
+        <div style={S.card}>
+          <div style={{ padding:"16px 20px" }}>
+            <p style={{ ...S.label, marginBottom:8 }}>AI-Generated Content</p>
+            <textarea value={content} onChange={e=>setContent(e.target.value)}
+              placeholder="Paste the AI-generated text here..."
+              rows={8} style={S.textarea} />
+          </div>
+          <div style={{ borderTop:"1px solid #18182e", padding:"12px 20px",
+            display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+            <span style={{ fontFamily:"'DM Mono',monospace", fontSize:10, color:"#333350" }}>
+              {content.trim().split(/\s+/).filter(Boolean).length} words
+            </span>
+            <button onClick={handleAudit} disabled={loading || !content.trim()} style={{
+              ...S.btn(), opacity: loading || !content.trim() ? 0.5 : 1
+            }}>
+              {loading ? "Auditing..." : "Run Audit →"}
+            </button>
+          </div>
+        </div>
+      ) : (
+        <div>
+          {bulkItems.map((item, idx) => (
+            <div key={item.id} style={{ ...S.card, marginBottom:10 }}>
+              <div style={{ ...S.cardHead }}>
+                <input value={item.label} onChange={e=>updateBulkItem(item.id,"label",e.target.value)}
+                  style={{ ...S.input, fontSize:12, color:"#8888aa", width:140 }} />
+                {bulkItems.length > 1 && (
+                  <button onClick={()=>removeBulkItem(item.id)} style={S.btn("danger")}>✕ Remove</button>
+                )}
+              </div>
+              <div style={{ padding:"12px 20px" }}>
+                <textarea value={item.content} onChange={e=>updateBulkItem(item.id,"content",e.target.value)}
+                  placeholder={`Paste content for ${item.label}...`}
+                  rows={4} style={S.textarea} />
+              </div>
+            </div>
+          ))}
+          <div style={{ display:"flex", gap:10, marginBottom:20 }}>
+            <button onClick={addBulkItem} style={S.ghost}>+ Add Item</button>
+            <button onClick={handleAudit}
+              disabled={loading || !bulkItems.some(i=>i.content.trim())}
+              style={{ ...S.btn(), opacity: loading ? 0.5 : 1 }}>
+              {loading ? `Auditing ${bulkItems.length} items...` : `Audit All ${bulkItems.filter(i=>i.content.trim()).length} Items →`}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Single Result */}
+      {result && !bulkMode && (
+        <div ref={resultRef} style={{ marginTop:24 }}>
+          {/* Overall */}
+          <div style={{ ...S.card, padding:28, display:"flex", gap:24, alignItems:"center", flexWrap:"wrap", marginBottom:14 }}>
+            <Ring score={result.overall} size={96} />
+            <div style={{ flex:1, minWidth:180 }}>
+              <div style={{ display:"flex", alignItems:"baseline", gap:14, marginBottom:6 }}>
+                <span style={{ fontFamily:"'DM Mono',monospace", fontSize:52,
+                  fontWeight:700, color:scoreColor(result.overall), lineHeight:1 }}>
+                  {grade(result.overall)}
+                </span>
+                <Tag>{result.overall}/10 overall</Tag>
+                {vendor && <Tag color="#ffe156">{vendor}</Tag>}
+              </div>
+              <p style={{ color:"#aaaacc", fontSize:14, lineHeight:1.6 }}>{result.verdict}</p>
+            </div>
+            {result.redFlags?.length > 0 && (
+              <div style={{ background:"#1a080e", border:"1px solid #ff446622",
+                borderRadius:10, padding:"14px 18px", minWidth:200 }}>
+                <p style={{ ...S.label, color:"#ff4466", marginBottom:8 }}>Red Flags</p>
+                {result.redFlags.map((f,i) => (
+                  <p key={i} style={{ color:"#ff446688", fontSize:12, marginBottom:4, lineHeight:1.5 }}>▸ {f}</p>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Dimension grid */}
+          <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(240px,1fr))", gap:12, marginBottom:14 }}>
+            {rubrics.map(r => {
+              const s = result.scores?.[r.id] ?? 0;
+              const c = result.critiques?.[r.id] ?? "";
+              return (
+                <div key={r.id} style={{ ...S.card, padding:"16px 18px" }}>
+                  <div style={{ display:"flex", justifyContent:"space-between", marginBottom:8 }}>
+                    <div>
+                      <span style={{ color:scoreColor(s), marginRight:6 }}>{r.icon}</span>
+                      <span style={{ fontFamily:"'DM Mono',monospace", fontSize:12, fontWeight:700 }}>{r.label}</span>
+                      <p style={{ color:"#333350", fontSize:10, marginTop:2, fontFamily:"'DM Mono',monospace" }}>{r.desc}</p>
+                    </div>
+                    <span style={{ fontFamily:"'DM Mono',monospace", fontSize:20, fontWeight:700, color:scoreColor(s) }}>{s}</span>
+                  </div>
+                  <Bar score={s} animate={animate} />
+                  <p style={{ color:"#666688", fontSize:12, marginTop:8, lineHeight:1.5 }}>{c}</p>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* Suspicious claims */}
+          {result.suspiciousClaims?.length > 0 && (
+            <div style={{ ...S.card, padding:"18px 22px", marginBottom:14 }}>
+              <p style={{ ...S.label, color:"#ffe156", marginBottom:12 }}>⚠ Unverified Claims</p>
+              <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
+                {result.suspiciousClaims.map((c,i) => (
+                  <div key={i} style={{ display:"flex", gap:12, alignItems:"flex-start",
+                    background:"#0f0f00", borderRadius:8, padding:"10px 14px",
+                    border:"1px solid #ffe15622" }}>
+                    <span style={{ color:"#ffe156", fontSize:14, flexShrink:0 }}>⚑</span>
+                    <div>
+                      <p style={{ fontFamily:"'DM Mono',monospace", fontSize:12,
+                        color:"#ffe156", marginBottom:4 }}>"{c.claim}"</p>
+                      <p style={{ color:"#888866", fontSize:12 }}>{c.reason}</p>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* AI patterns */}
+          {result.aiPatterns?.length > 0 && (
+            <div style={{ ...S.card, padding:"16px 22px", marginBottom:14 }}>
+              <p style={{ ...S.label, color:"#ff8c42", marginBottom:10 }}>AI Fingerprints Detected</p>
+              <div style={{ display:"flex", gap:8, flexWrap:"wrap" }}>
+                {result.aiPatterns.map((p,i) => <Tag key={i} color="#ff8c42">{p}</Tag>)}
+              </div>
+            </div>
+          )}
+
+          {/* Top fix */}
+          {result.topFix && (
+            <div style={{ background:"linear-gradient(135deg,#0a1a12,#0d0d1e)",
+              border:"1px solid #00ffa322", borderRadius:12,
+              padding:"18px 22px", display:"flex", gap:14, alignItems:"flex-start" }}>
+              <span style={{ fontSize:20, flexShrink:0 }}>◈</span>
+              <div>
+                <p style={{ ...S.label, color:"#00ffa3", marginBottom:6 }}>Top Improvement</p>
+                <p style={{ color:"#aaaacc", fontSize:14, lineHeight:1.6 }}>{result.topFix}</p>
+              </div>
+            </div>
+          )}
+
+          <div style={{ textAlign:"center", marginTop:28 }}>
+            <button onClick={()=>{setResult(null);setContent("");setContext("");setVendor("");setAnimate(false);}}
+              style={S.ghost}>Audit Another →</button>
+          </div>
+        </div>
+      )}
+
+      {/* Bulk Results */}
+      {bulkResults.length > 0 && bulkMode && (
+        <div ref={resultRef} style={{ marginTop:24 }}>
+          <p style={{ ...S.sectionTitle }}>Bulk Results — {bulkResults.length} items</p>
+          <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
+            {bulkResults.map((r, i) => (
+              <div key={i} style={{ ...S.card, padding:"18px 22px",
+                display:"flex", gap:20, alignItems:"center", flexWrap:"wrap" }}>
+                {r.error ? (
+                  <span style={{ color:"#ff4466", fontFamily:"'DM Mono',monospace", fontSize:12 }}>
+                    ✕ {r.label} — audit failed
+                  </span>
+                ) : (
+                  <>
+                    <Ring score={r.overall} size={56} />
+                    <div style={{ flex:1, minWidth:180 }}>
+                      <div style={{ display:"flex", gap:8, alignItems:"center", marginBottom:6 }}>
+                        <span style={{ fontFamily:"'DM Mono',monospace", fontSize:14, fontWeight:700 }}>{r.label}</span>
+                        <Tag>{grade(r.overall)}</Tag>
+                        <Tag color={scoreColor(r.overall)}>{r.overall}/10</Tag>
+                      </div>
+                      <p style={{ color:"#666688", fontSize:13 }}>{r.verdict}</p>
+                    </div>
+                    <div style={{ display:"flex", gap:8, flexWrap:"wrap" }}>
+                      {rubrics.slice(0,3).map(rb => (
+                        <div key={rb.id} style={{ textAlign:"center" }}>
+                          <div style={{ fontFamily:"'DM Mono',monospace", fontSize:11, color:scoreColor(r.scores?.[rb.id]??0) }}>
+                            {r.scores?.[rb.id]??0}
+                          </div>
+                          <div style={{ fontSize:9, color:"#333350", fontFamily:"'DM Mono',monospace", letterSpacing:1 }}>
+                            {rb.label.split(" ")[0].toUpperCase()}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </>
+                )}
+              </div>
+            ))}
+          </div>
+          {vendor && (
+            <div style={{ marginTop:16, padding:"14px 18px",
+              background:"#0a1a12", border:"1px solid #00ffa322", borderRadius:10 }}>
+              <p style={{ color:"#00ffa3", fontFamily:"'DM Mono',monospace", fontSize:12 }}>
+                ✓ Scores saved to vendor scorecard: <strong>{vendor}</strong>
+              </p>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+
+  const renderHistory = () => (
+    <div style={{ paddingTop:32 }}>
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:24 }}>
+        <div>
+          <p style={S.sectionTitle}>Audit History</p>
+          <p style={{ color:"#444460", fontSize:13, marginTop:-12 }}>{history.length} audits stored locally</p>
+        </div>
+        {history.length > 0 && (
+          <button onClick={clearHistory} style={S.btn("danger")}>Clear All</button>
+        )}
+      </div>
+      {history.length === 0 ? (
+        <div style={{ textAlign:"center", padding:"60px 20px", color:"#333350" }}>
+          <p style={{ fontSize:32, marginBottom:12 }}>◌</p>
+          <p style={{ fontFamily:"'DM Mono',monospace", fontSize:12, letterSpacing:2 }}>NO AUDITS YET</p>
+          <p style={{ fontSize:13, marginTop:8 }}>Run your first audit to see history here</p>
+        </div>
+      ) : (
+        <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
+          {history.map(h => (
+            <div key={h.id} style={{ ...S.card, padding:"16px 20px",
+              display:"flex", gap:16, alignItems:"center", flexWrap:"wrap" }}>
+              <Ring score={h.overall} size={52} />
+              <div style={{ flex:1, minWidth:160 }}>
+                <div style={{ display:"flex", gap:8, flexWrap:"wrap", marginBottom:4 }}>
+                  <Tag>{grade(h.overall)}</Tag>
+                  {h.vendor && <Tag color="#ffe156">{h.vendor}</Tag>}
+                  {h.label && <Tag color="#8888ff">{h.label}</Tag>}
+                </div>
+                <p style={{ color:"#666688", fontSize:12, lineHeight:1.5 }}>{h.verdict}</p>
+                <p style={{ color:"#333350", fontSize:10, marginTop:4,
+                  fontFamily:"'DM Mono',monospace" }}>
+                  {new Date(h.date).toLocaleDateString()} · {h.context || "No context"}
+                </p>
+              </div>
+              <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
+                {Object.entries(h.scores||{}).slice(0,4).map(([k,v]) => (
+                  <div key={k} style={{ background:"#111124", borderRadius:6,
+                    padding:"4px 8px", textAlign:"center" }}>
+                    <div style={{ fontFamily:"'DM Mono',monospace", fontSize:12,
+                      color:scoreColor(v), fontWeight:700 }}>{v}</div>
+                    <div style={{ fontSize:8, color:"#333350",
+                      fontFamily:"'DM Mono',monospace", letterSpacing:1 }}>
+                      {k.slice(0,3).toUpperCase()}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+
+  const renderVendors = () => {
+    const vendorList = Object.values(vendors);
+    return (
+      <div style={{ paddingTop:32 }}>
+        <p style={S.sectionTitle}>Vendor Scorecards</p>
+        <p style={{ color:"#444460", fontSize:13, marginTop:-16, marginBottom:24 }}>
+          Track quality scores per vendor, agency, or contractor over time.
+        </p>
+        {vendorList.length === 0 ? (
+          <div style={{ textAlign:"center", padding:"60px 20px", color:"#333350" }}>
+            <p style={{ fontSize:32, marginBottom:12 }}>◌</p>
+            <p style={{ fontFamily:"'DM Mono',monospace", fontSize:12, letterSpacing:2 }}>NO VENDORS YET</p>
+            <p style={{ fontSize:13, marginTop:8 }}>Fill in the "Vendor/Source" field when auditing to track scores here</p>
+          </div>
+        ) : (
+          <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(280px,1fr))", gap:16 }}>
+            {vendorList.map(v => {
+              const avg = v.audits.length
+                ? Math.round(v.audits.reduce((s,a)=>s+a.overall,0)/v.audits.length*10)/10
+                : 0;
+              const trend = v.audits.length >= 2
+                ? v.audits[0].overall - v.audits[1].overall
+                : 0;
+              return (
+                <div key={v.name} style={{ ...S.card, padding:"22px 24px" }}>
+                  <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:16 }}>
+                    <div>
+                      <p style={{ fontFamily:"'DM Mono',monospace", fontSize:14,
+                        fontWeight:700, color:"#ddddf0", marginBottom:4 }}>{v.name}</p>
+                      <p style={{ color:"#444460", fontSize:11,
+                        fontFamily:"'DM Mono',monospace" }}>{v.audits.length} audit{v.audits.length!==1?"s":""}</p>
+                    </div>
+                    <button onClick={()=>deleteVendor(v.name)}
+                      style={{ ...S.btn("danger"), padding:"4px 10px", fontSize:10 }}>✕</button>
+                  </div>
+                  <div style={{ display:"flex", alignItems:"center", gap:16, marginBottom:16 }}>
+                    <Ring score={avg} size={64} />
+                    <div>
+                      <p style={{ fontFamily:"'DM Mono',monospace", fontSize:11,
+                        color:"#444460", marginBottom:4 }}>AVG SCORE</p>
+                      <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+                        <span style={{ fontFamily:"'DM Mono',monospace", fontSize:28,
+                          fontWeight:700, color:scoreColor(avg) }}>{avg}</span>
+                        {trend !== 0 && (
+                          <span style={{ fontFamily:"'DM Mono',monospace", fontSize:12,
+                            color: trend > 0 ? "#00ffa3" : "#ff4466" }}>
+                            {trend > 0 ? "↑" : "↓"}{Math.abs(trend).toFixed(1)}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                  <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
+                    {v.audits.slice(0,4).map((a,i) => (
+                      <div key={i} style={{ display:"flex", justifyContent:"space-between",
+                        alignItems:"center", padding:"6px 0",
+                        borderBottom:"1px solid #14142a" }}>
+                        <span style={{ fontSize:11, color:"#444460" }}>
+                          {new Date(a.date).toLocaleDateString()}
+                        </span>
+                        <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+                          <div style={{ width:60 }}><Bar score={a.overall} animate={true} height={3} /></div>
+                          <span style={{ fontFamily:"'DM Mono',monospace", fontSize:12,
+                            color:scoreColor(a.overall), fontWeight:700 }}>{a.overall}</span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const renderRubrics = () => (
+    <div style={{ paddingTop:32 }}>
+      <p style={S.sectionTitle}>Custom Rubrics</p>
+      <p style={{ color:"#444460", fontSize:13, marginTop:-16, marginBottom:28 }}>
+        Define your own quality dimensions. These replace the defaults for all future audits.
+      </p>
+      <div style={{ display:"flex", flexDirection:"column", gap:10, marginBottom:24 }}>
+        {rubrics.map((r, idx) => (
+          <div key={r.id} style={{ ...S.card, padding:"14px 20px",
+            display:"flex", gap:14, alignItems:"center" }}>
+            <span style={{ color:"#00ffa3", fontSize:16, width:20 }}>{r.icon || "◆"}</span>
+            {editingRubric === r.id ? (
+              <div style={{ flex:1, display:"flex", gap:10, flexWrap:"wrap" }}>
+                <input defaultValue={r.label}
+                  onBlur={e => {
+                    const updated = rubrics.map(x => x.id===r.id ? {...x, label:e.target.value} : x);
+                    saveRubrics(updated); setEditingRubric(null);
+                  }}
+                  style={{ ...S.input, background:"#14142a", padding:"6px 10px",
+                    borderRadius:6, fontSize:13, width:180 }} />
+                <input defaultValue={r.desc}
+                  onBlur={e => {
+                    const updated = rubrics.map(x => x.id===r.id ? {...x, desc:e.target.value} : x);
+                    saveRubrics(updated);
+                  }}
+                  style={{ ...S.input, background:"#14142a", padding:"6px 10px",
+                    borderRadius:6, fontSize:13, flex:1 }} />
+              </div>
+            ) : (
+              <div style={{ flex:1 }}>
+                <span style={{ fontFamily:"'DM Mono',monospace", fontSize:13,
+                  fontWeight:700, color:"#ddddf0" }}>{r.label}</span>
+                <span style={{ color:"#444460", fontSize:12, marginLeft:10 }}>{r.desc}</span>
+              </div>
+            )}
+            <div style={{ display:"flex", gap:6 }}>
+              <button onClick={()=>setEditingRubric(editingRubric===r.id ? null : r.id)}
+                style={{ ...S.ghost, padding:"4px 10px", fontSize:10 }}>
+                {editingRubric===r.id ? "Done" : "Edit"}
+              </button>
+              {rubrics.length > 2 && (
+                <button onClick={()=>saveRubrics(rubrics.filter(x=>x.id!==r.id))}
+                  style={{ ...S.btn("danger"), padding:"4px 10px", fontSize:10 }}>✕</button>
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {/* Add new rubric */}
+      <div style={{ ...S.card, padding:"18px 22px" }}>
+        <p style={{ ...S.label, marginBottom:14 }}>Add Custom Dimension</p>
+        <div style={{ display:"flex", gap:10, flexWrap:"wrap" }}>
+          <input value={newRubric.label} onChange={e=>setNewRubric(p=>({...p,label:e.target.value}))}
+            placeholder="Dimension name (e.g. Compliance)"
+            style={{ ...S.input, background:"#14142a", padding:"10px 14px",
+              borderRadius:8, fontSize:13, flex:"0 0 200px" }} />
+          <input value={newRubric.desc} onChange={e=>setNewRubric(p=>({...p,desc:e.target.value}))}
+            placeholder="Description (e.g. Meets regulatory requirements)"
+            style={{ ...S.input, background:"#14142a", padding:"10px 14px",
+              borderRadius:8, fontSize:13, flex:1 }} />
+          <button onClick={()=>{
+            if (!newRubric.label.trim()) return;
+            const id = newRubric.label.toLowerCase().replace(/\s+/g,"_");
+            const icons = ["◆","▲","●","■","◉","⬢"];
+            const updated = [...rubrics, { id, label:newRubric.label, desc:newRubric.desc,
+              icon: icons[rubrics.length % icons.length] }];
+            saveRubrics(updated);
+            setNewRubric({ label:"", desc:"" });
+          }} style={S.btn()}>Add →</button>
+        </div>
+      </div>
+
+      {/* Reset */}
+      <div style={{ marginTop:16, textAlign:"right" }}>
+        <button onClick={()=>saveRubrics(DEFAULT_RUBRICS)} style={S.ghost}>
+          Reset to Defaults
+        </button>
+      </div>
+    </div>
+  );
+
+  return (
+    <div style={S.wrap}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500;700&family=DM+Sans:wght@300;400;500;600&display=swap');
+        * { box-sizing:border-box; margin:0; padding:0; }
+        ::-webkit-scrollbar { width:4px; }
+        ::-webkit-scrollbar-track { background:#080812; }
+        ::-webkit-scrollbar-thumb { background:#1a1a2e; border-radius:2px; }
+        textarea { resize:vertical; }
+        button:hover { opacity:0.88; }
+        @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.2} }
+        @keyframes fadeUp { from{opacity:0;transform:translateY(16px)} to{opacity:1;transform:translateY(0)} }
+        .fade-up { animation: fadeUp 0.4s ease forwards; }
+      `}</style>
+
+      {/* Notification */}
+      {notification && (
+        <div style={{
+          position:"fixed", top:16, right:16, zIndex:200,
+          background: notification.type==="error" ? "#1a080e" : "#0a1a12",
+          border:`1px solid ${notification.type==="error" ? "#ff446644" : "#00ffa344"}`,
+          borderRadius:8, padding:"10px 18px",
+          fontFamily:"'DM Mono',monospace", fontSize:12,
+          color: notification.type==="error" ? "#ff4466" : "#00ffa3",
+          boxShadow:"0 4px 24px rgba(0,0,0,0.4)"
+        }} className="fade-up">
+          {notification.type==="error" ? "✕" : "✓"} {notification.msg}
+        </div>
+      )}
+
+      {/* Nav */}
+      <nav style={S.nav}>
+        <div style={S.logo}>
+          <div style={S.logoDot} />
+          AuditAI Pro
+        </div>
+        <div style={S.tabs}>
+          {TABS.map(t => (
+            <button key={t} onClick={()=>setTab(t)} style={S.tab(tab===t)}>
+              {t}
+              {t==="History" && history.length > 0 &&
+                <span style={{ marginLeft:4, background:"#00ffa322", color:"#00ffa3",
+                  borderRadius:8, padding:"1px 5px", fontSize:9 }}>{history.length}</span>}
+              {t==="Vendors" && Object.keys(vendors).length > 0 &&
+                <span style={{ marginLeft:4, background:"#ffe15622", color:"#ffe156",
+                  borderRadius:8, padding:"1px 5px", fontSize:9 }}>{Object.keys(vendors).length}</span>}
+            </button>
+          ))}
+        </div>
+      </nav>
+
+      {/* Content */}
+      <div style={S.inner}>
+        {tab==="Audit"   && renderAudit()}
+        {tab==="History" && renderHistory()}
+        {tab==="Vendors" && renderVendors()}
+        {tab==="Rubrics" && renderRubrics()}
+      </div>
+    </div>
+  );
+}
